@@ -1,4 +1,4 @@
-# main.py - Improved FastAPI application for Railway deployment
+# main.py - Updated FastAPI application for Railway deployment with modern Zillow URL structure
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 import json
 import time
 import random
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, unquote
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 import re
@@ -61,31 +61,55 @@ class ZillowRealEstateAPI:
         })
         # Add delay between requests to avoid rate limiting
         self.request_delay = 2
+        
+        # Default map bounds for major cities (you can expand this)
+        self.city_bounds = {
+            'san francisco': {'west': -122.61529055957031, 'east': -122.25136844042969, 'south': 37.66231632707035, 'north': 37.8880952040113},
+            'los angeles': {'west': -118.6681759, 'east': -117.9441986, 'south': 33.7036917, 'north': 34.3373061},
+            'new york': {'west': -74.2590879, 'east': -73.7004681, 'south': 40.4774, 'north': 40.9176},
+            'chicago': {'west': -87.9401, 'east': -87.5241, 'south': 41.6445, 'north': 42.0230},
+            'miami': {'west': -80.8738, 'east': -80.1166, 'south': 25.6634, 'north': 25.8553}
+        }
     
     def find_subject_property_and_comps(self, city: str, state: str, min_price: int, max_price: int, map_bounds: Optional[MapBounds] = None) -> Dict[str, Any]:
         try:
             logger.info(f"Searching for properties in {city}, {state} with price range ${min_price:,} - ${max_price:,}")
             
-            # First, try to get the location ID for the city
-            location_info = self._get_location_info(city, state)
-            if not location_info:
-                logger.warning(f"Could not find location info for {city}, {state}")
+            # Get region information and build modern URL
+            region_info = self._get_region_info(city, state)
+            if not region_info:
+                logger.warning(f"Could not find region info for {city}, {state}")
                 return {
-                    "error": f"Could not find location information for {city}, {state}",
+                    "error": f"Could not find region information for {city}, {state}",
                     "subject_property": None,
                     "comparables": [],
                     "total_comps_found": 0
                 }
             
+            # Use provided map bounds or default ones
+            if not map_bounds:
+                city_key = city.lower().replace(' ', ' ')
+                if city_key in self.city_bounds:
+                    bounds = self.city_bounds[city_key]
+                    map_bounds = MapBounds(
+                        west=bounds['west'],
+                        east=bounds['east'],
+                        south=bounds['south'],
+                        north=bounds['north']
+                    )
+                else:
+                    # Default bounds (approximate US bounds)
+                    map_bounds = MapBounds(west=-125, east=-66, south=25, north=49)
+            
             # Search for active listings (subject property)
-            subject_properties = self._search_properties(location_info, min_price, max_price, "for_sale")
+            subject_properties = self._search_properties_modern(region_info, min_price, max_price, map_bounds, "for_sale")
             subject_property = subject_properties[0] if subject_properties else None
             
             if not subject_property:
                 logger.warning(f"No active listings found in {city}, {state}")
             
             # Search for sold properties (comparables)
-            comparables = self._search_properties(location_info, min_price, max_price, "sold", limit=10)
+            comparables = self._search_properties_modern(region_info, min_price, max_price, map_bounds, "sold", limit=10)
             
             logger.info(f"Found {len(comparables)} comparable properties")
             
@@ -93,7 +117,7 @@ class ZillowRealEstateAPI:
                 "subject_property": self._format_property_output(subject_property) if subject_property else None,
                 "comparables": [self._format_property_output(comp, is_comp=True) for comp in comparables],
                 "total_comps_found": len(comparables),
-                "location_info": location_info  # Include for debugging
+                "region_info": region_info  # Include for debugging
             }
             
         except Exception as e:
@@ -105,215 +129,308 @@ class ZillowRealEstateAPI:
                 "total_comps_found": 0
             }
     
-    def _get_location_info(self, city: str, state: str) -> Optional[Dict]:
-        """Get location information including region ID and proper URL format"""
+    def _get_region_info(self, city: str, state: str) -> Optional[Dict]:
+        """Get region information by trying the basic city page first"""
         try:
-            # Try different URL formats for the city based on current Zillow structure
+            # Format city name for URL
             city_formatted = city.lower().replace(' ', '-')
             state_formatted = state.lower()
             
-            possible_urls = [
+            # Try the modern URL structure first
+            base_url = f"https://www.zillow.com/{city_formatted}-{state_formatted}/"
+            
+            logger.info(f"Trying to get region info from: {base_url}")
+            time.sleep(self.request_delay)
+            
+            response = self.session.get(base_url, timeout=15)
+            logger.info(f"Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                region_info = self._extract_region_info_modern(response.text, city, state)
+                if region_info:
+                    region_info['base_url'] = base_url
+                    return region_info
+            
+            # Fallback: try alternative formats
+            alternative_urls = [
                 f"https://www.zillow.com/homes/{city_formatted}-{state_formatted}_rb/",
-                f"https://www.zillow.com/{city_formatted}-{state_formatted}/",
-                f"https://www.zillow.com/homes/{city_formatted}_{state_formatted}_rb/",
-                f"https://www.zillow.com/{city_formatted}-{state_formatted}-{state_formatted}/",
+                f"https://www.zillow.com/{city_formatted}_{state_formatted}/",
                 f"https://www.zillow.com/homes/for_sale/{city_formatted}-{state_formatted}/",
             ]
             
-            for url in possible_urls:
-                logger.info(f"Trying URL: {url}")
-                time.sleep(self.request_delay)
-                
+            for url in alternative_urls:
                 try:
+                    logger.info(f"Trying alternative URL: {url}")
+                    time.sleep(self.request_delay)
                     response = self.session.get(url, timeout=15)
-                    logger.info(f"Response status: {response.status_code} for URL: {url}")
                     
                     if response.status_code == 200:
-                        # Check if the page contains property listings or region data
-                        if self._validate_zillow_page(response.text):
-                            region_info = self._extract_region_info(response.text, url)
-                            if region_info:
-                                logger.info(f"Successfully found location info for {city}, {state}")
-                                return region_info
-                            else:
-                                # Even if we can't extract region info, if it's a valid page, use it
-                                logger.info(f"Valid Zillow page found, using basic info for {city}, {state}")
-                                return {
-                                    'region_id': 0,
-                                    'region_type': 6,
-                                    'base_url': url,
-                                    'region_name': f"{city}, {state}",
-                                    'state_abbreviation': state
-                                }
-                    elif response.status_code == 404:
-                        logger.info(f"URL not found: {url}")
-                    else:
-                        logger.warning(f"Unexpected status code {response.status_code} for {url}")
-                        
+                        region_info = self._extract_region_info_modern(response.text, city, state)
+                        if region_info:
+                            region_info['base_url'] = url
+                            return region_info
                 except Exception as e:
                     logger.warning(f"Failed to fetch {url}: {str(e)}")
                     continue
             
-            logger.warning(f"Could not find valid URL for {city}, {state}")
-            return None
+            # If all else fails, create a basic region info
+            logger.warning(f"Could not extract region info, using default for {city}, {state}")
+            return {
+                'region_id': 0,
+                'region_type': 6,
+                'base_url': base_url,
+                'region_name': f"{city}, {state}",
+                'city': city,
+                'state': state
+            }
             
         except Exception as e:
-            logger.error(f"Error getting location info: {str(e)}")
+            logger.error(f"Error getting region info: {str(e)}")
             return None
     
-    def _validate_zillow_page(self, html_content: str) -> bool:
-        """Check if the page is a valid Zillow property search page"""
+    def _extract_region_info_modern(self, html_content: str, city: str, state: str) -> Optional[Dict]:
+        """Extract region information from modern Zillow page"""
         try:
-            # Check for common Zillow page elements
-            indicators = [
-                'zillow.com',
-                'property',
-                'real estate',
-                'homes for sale',
-                'searchPageState',
-                'listResults',
-                'property-card',
-                'SearchPageState'
+            # Look for region data in script tags
+            region_patterns = [
+                r'"regionId":(\d+)',
+                r'"regionType":(\d+)',
+                r'regionId.*?(\d+)',
+                r'regionType.*?(\d+)'
             ]
             
-            html_lower = html_content.lower()
-            found_indicators = sum(1 for indicator in indicators if indicator in html_lower)
+            region_id = None
+            region_type = 6  # Default region type
             
-            # If we find at least 3 indicators, consider it a valid Zillow page
-            is_valid = found_indicators >= 3
-            logger.info(f"Page validation: {found_indicators}/{len(indicators)} indicators found, valid: {is_valid}")
+            # Try to find region ID
+            for pattern in region_patterns[:2]:  # First two are more specific
+                match = re.search(pattern, html_content)
+                if match:
+                    if 'regionId' in pattern:
+                        region_id = int(match.group(1))
+                    elif 'regionType' in pattern:
+                        region_type = int(match.group(1))
             
-            return is_valid
+            # If we found a region ID, use it
+            if region_id:
+                return {
+                    'region_id': region_id,
+                    'region_type': region_type,
+                    'region_name': f"{city}, {state}",
+                    'city': city,
+                    'state': state
+                }
             
-    
-    def _extract_region_info(self, html_content: str, base_url: str) -> Optional[Dict]:
-        """Extract region information from Zillow page"""
-        try:
-            soup = BeautifulSoup(html_content, 'html.parser')
+            # Fallback: look for any numeric ID that might be region-related
+            id_patterns = [
+                r'"id":(\d{4,})',  # Look for IDs with 4+ digits
+                r'data-region-id="(\d+)"',
+                r'regionId.*?(\d{4,})'
+            ]
             
-            # Look for JSON data in script tags
-            script_tags = soup.find_all('script', type='application/json')
-            for script in script_tags:
-                try:
-                    data = json.loads(script.string)
-                    if 'props' in data and 'pageProps' in data['props']:
-                        page_props = data['props']['pageProps']
-                        if 'regionId' in page_props:
+            for pattern in id_patterns:
+                matches = re.findall(pattern, html_content)
+                if matches:
+                    # Use the first reasonable-looking ID
+                    for match in matches:
+                        region_id = int(match)
+                        if 1000 <= region_id <= 999999:  # Reasonable range for region IDs
                             return {
-                                'region_id': page_props['regionId'],
-                                'region_type': page_props.get('regionType', 6),
-                                'base_url': base_url,
-                                'region_name': page_props.get('regionName', ''),
-                                'state_abbreviation': page_props.get('stateAbbreviation', '')
+                                'region_id': region_id,
+                                'region_type': region_type,
+                                'region_name': f"{city}, {state}",
+                                'city': city,
+                                'state': state
                             }
-                except (json.JSONDecodeError, KeyError):
-                    continue
             
-            # Fallback: look for region data in other script tags
-            script_tags = soup.find_all('script')
-            for script in script_tags:
-                if script.string and 'regionId' in script.string:
-                    try:
-                        # Try to extract region ID using regex
-                        region_match = re.search(r'"regionId":(\d+)', script.string)
-                        region_type_match = re.search(r'"regionType":(\d+)', script.string)
-                        
-                        if region_match:
-                            return {
-                                'region_id': int(region_match.group(1)),
-                                'region_type': int(region_type_match.group(1)) if region_type_match else 6,
-                                'base_url': base_url,
-                                'region_name': '',
-                                'state_abbreviation': ''
-                            }
-                    except Exception as e:
-                        continue
-            
+            logger.warning(f"Could not extract region ID from page for {city}, {state}")
             return None
             
         except Exception as e:
             logger.error(f"Error extracting region info: {str(e)}")
             return None
     
-    def _search_properties(self, location_info: Dict, min_price: int, max_price: int, status: str, limit: int = 10) -> List[Property]:
-        """Search for properties using Zillow's search page"""
+    def _search_properties_modern(self, region_info: Dict, min_price: int, max_price: int, map_bounds: MapBounds, status: str, limit: int = 10) -> List[Property]:
+        """Search properties using modern Zillow URL structure"""
         try:
-            base_url = location_info['base_url']
+            city_formatted = region_info['city'].lower().replace(' ', '-')
+            state_formatted = region_info['state'].lower()
+            base_url = f"https://www.zillow.com/{city_formatted}-{state_formatted}/"
             
-            # Build search URL with filters
-            if status == "for_sale":
-                # For active listings
-                if base_url.endswith('_rb/'):
-                    search_url = base_url[:-4] + f"/{min_price}-{max_price}_price/_rb/"
-                else:
-                    search_url = base_url.rstrip('/') + f"/{min_price}-{max_price}_price/"
-            else:
-                # For sold properties
-                if base_url.endswith('_rb/'):
-                    search_url = base_url[:-4] + f"/sold/{min_price}-{max_price}_price/_rb/"
-                else:
-                    search_url = base_url.rstrip('/') + f"/sold/{min_price}-{max_price}_price/"
+            # Build the search query state
+            search_query = {
+                "pagination": {},
+                "isMapVisible": True,
+                "mapBounds": {
+                    "west": map_bounds.west,
+                    "east": map_bounds.east,
+                    "south": map_bounds.south,
+                    "north": map_bounds.north
+                },
+                "filterState": {
+                    "sort": {"value": "globalrelevanceex"},
+                    "price": {"min": min_price, "max": max_price}
+                },
+                "isListVisible": True,
+                "mapZoom": 11,
+                "usersSearchTerm": f"{region_info['city']} {region_info['state']}",
+                "listPriceActive": True
+            }
             
-            logger.info(f"Searching: {search_url}")
+            # Add region selection if we have a valid region ID
+            if region_info.get('region_id', 0) > 0:
+                search_query["regionSelection"] = [{
+                    "regionId": region_info['region_id'],
+                    "regionType": region_info.get('region_type', 6)
+                }]
+            
+            # Modify filter state based on status
+            if status == "sold":
+                # Add sold filter
+                search_query["filterState"]["rs"] = {"value": "SOLD"}
+                search_query["filterState"]["sort"] = {"value": "globalrelevanceex"}
+                search_query["listPriceActive"] = False
+            
+            # Encode the search query
+            search_query_encoded = quote(json.dumps(search_query, separators=(',', ':')))
+            search_url = f"{base_url}?searchQueryState={search_query_encoded}"
+            
+            logger.info(f"Modern search URL: {search_url[:200]}...")  # Log first 200 chars
             
             time.sleep(self.request_delay)
             response = self.session.get(search_url, timeout=15)
             
             if response.status_code != 200:
-                # Try alternative URL format
-                alt_url = f"https://www.zillow.com/homes/for_sale/{min_price}-{max_price}_price/?searchQueryState=%7B%22pagination%22%3A%7B%7D%2C%22isMapVisible%22%3Atrue%7D"
-                logger.info(f"Trying alternative URL: {alt_url}")
-                time.sleep(self.request_delay)
-                response = self.session.get(alt_url, timeout=15)
-            
-            if response.status_code != 200:
                 logger.warning(f"Search request failed with status {response.status_code}")
                 return []
             
-            properties = self._parse_search_results(response.text, status)
-            logger.info(f"Parsed {len(properties)} properties from search results")
+            properties = self._parse_modern_search_results(response.text, status)
+            logger.info(f"Parsed {len(properties)} properties from modern search results")
             
             return properties[:limit]
             
         except Exception as e:
-            logger.error(f"Error searching properties: {str(e)}")
+            logger.error(f"Error in modern property search: {str(e)}")
             return []
     
-    def _build_search_params(self, location_info: Dict, min_price: int, max_price: int, status: str) -> Dict:
-        """Build search parameters for Zillow URL"""
-        params = {}
-        
-        if status == "for_sale":
-            params.update({
-                'price_min': min_price,
-                'price_max': max_price,
-                'home_type': 'Houses,Condos,Townhomes',
-                'for_sale': 'true'
-            })
-        elif status == "sold":
-            params.update({
-                'price_min': min_price,
-                'price_max': max_price,
-                'home_type': 'Houses,Condos,Townhomes',
-                'sold_within': '3mo'  # Last 3 months
-            })
-        
-        return params
-    
-    def _parse_search_results(self, html_content: str, status: str) -> List[Property]:
-        """Parse property listings from search results page"""
+    def _parse_modern_search_results(self, html_content: str, status: str) -> List[Property]:
+        """Parse property listings from modern Zillow search results"""
         try:
             properties = []
+            
+            # Method 1: Look for JSON data in script tags
+            properties.extend(self._extract_from_json_scripts(html_content, status))
+            
+            # Method 2: Parse HTML elements if JSON parsing fails
+            if not properties:
+                properties.extend(self._parse_html_property_cards(html_content, status))
+            
+            return properties
+            
+        except Exception as e:
+            logger.error(f"Error parsing modern search results: {str(e)}")
+            return []
+    
+    def _extract_from_json_scripts(self, html_content: str, status: str) -> List[Property]:
+        """Extract properties from JSON data in script tags"""
+        properties = []
+        
+        try:
+            # Look for common JSON patterns in Zillow pages
+            json_patterns = [
+                r'"listResults":\s*(\[.*?\])',
+                r'"searchResults":\s*(\[.*?\])',
+                r'"props":\s*({.*?"searchResults".*?})',
+                r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
+                r'{"listResults":\s*(\[.*?\])'
+            ]
+            
+            for pattern in json_patterns:
+                matches = re.finditer(pattern, html_content, re.DOTALL)
+                for match in matches:
+                    try:
+                        json_str = match.group(1) if len(match.groups()) == 1 else match.group(0)
+                        
+                        # Try to parse as JSON
+                        if json_str.startswith('['):
+                            # It's an array of listings
+                            listings = json.loads(json_str)
+                        elif json_str.startswith('{'):
+                            # It's an object, look for listings inside
+                            data = json.loads(json_str)
+                            listings = self._find_listings_in_json(data)
+                        else:
+                            continue
+                        
+                        # Process each listing
+                        for listing in listings:
+                            if isinstance(listing, dict):
+                                prop = self._create_property_from_json(listing, status)
+                                if prop and prop.price > 0:
+                                    properties.append(prop)
+                        
+                        if properties:  # If we found properties, stop looking
+                            break
+                            
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception as e:
+                        logger.debug(f"Error processing JSON match: {str(e)}")
+                        continue
+                
+                if properties:  # If we found properties, stop trying other patterns
+                    break
+        
+        except Exception as e:
+            logger.error(f"Error extracting from JSON scripts: {str(e)}")
+        
+        return properties
+    
+    def _find_listings_in_json(self, data: Dict) -> List[Dict]:
+        """Recursively find property listings in nested JSON data"""
+        listings = []
+        
+        if isinstance(data, dict):
+            # Common keys that contain property listings
+            listing_keys = ['listResults', 'searchResults', 'results', 'listings', 'properties']
+            
+            for key in listing_keys:
+                if key in data and isinstance(data[key], list):
+                    listings.extend(data[key])
+            
+            # Recursively search in nested objects
+            for value in data.values():
+                if isinstance(value, (dict, list)):
+                    listings.extend(self._find_listings_in_json(value))
+        
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    # Check if this item looks like a property listing
+                    if any(key in item for key in ['address', 'price', 'beds', 'baths', 'zpid']):
+                        listings.append(item)
+                    else:
+                        # Recursively search in nested items
+                        listings.extend(self._find_listings_in_json(item))
+        
+        return listings
+    
+    def _parse_html_property_cards(self, html_content: str, status: str) -> List[Property]:
+        """Parse property cards from HTML when JSON parsing fails"""
+        properties = []
+        
+        try:
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Look for property cards using various selectors
+            # Modern Zillow selectors
             property_selectors = [
                 'article[data-test="property-card"]',
-                '.property-card-data',
-                '.list-card-info',
                 '[data-test="property-card"]',
                 '.PropertyCard',
-                '.result-list-container article'
+                '.result-list-container article',
+                '.property-card',
+                '.ListItem',
+                '[role="presentation"]'
             ]
             
             for selector in property_selectors:
@@ -321,30 +438,26 @@ class ZillowRealEstateAPI:
                 if cards:
                     logger.info(f"Found {len(cards)} property cards using selector: {selector}")
                     for card in cards:
-                        prop = self._extract_property_from_card(card, status)
-                        if prop and prop.price > 0:  # Only add properties with valid prices
+                        prop = self._extract_property_from_modern_card(card, status)
+                        if prop and prop.price > 0:
                             properties.append(prop)
                     break
-            
-            # If no properties found, try alternative parsing methods
-            if not properties:
-                properties = self._parse_alternative_format(soup, status)
-            
-            return properties
-            
+        
         except Exception as e:
-            logger.error(f"Error parsing search results: {str(e)}")
-            return []
+            logger.error(f"Error parsing HTML property cards: {str(e)}")
+        
+        return properties
     
-    def _extract_property_from_card(self, card, status: str) -> Optional[Property]:
-        """Extract property information from a property card element"""
+    def _extract_property_from_modern_card(self, card, status: str) -> Optional[Property]:
+        """Extract property information from modern property card"""
         try:
-            # Extract price
+            # Modern price selectors
             price_selectors = [
                 '[data-test="property-card-price"]',
                 '.PropertyCardWrapper__StyledPriceLine',
-                '.list-card-price',
-                '.price'
+                '[data-testid="price"]',
+                '.price',
+                '.Text-c11n-8-99-0__sc-aiai24-0'
             ]
             
             price = 0
@@ -356,12 +469,13 @@ class ZillowRealEstateAPI:
                     if price > 0:
                         break
             
-            # Extract address
+            # Modern address selectors
             address_selectors = [
                 '[data-test="property-card-addr"]',
-                '.PropertyCardWrapper__StyledAddress',
-                '.list-card-addr',
-                '.address'
+                '.PropertyCardWrapper__StyledPropertyCardDataWrapper address',
+                '[data-testid="address"]',
+                '.address',
+                'address'
             ]
             
             address = "Address not available"
@@ -371,11 +485,11 @@ class ZillowRealEstateAPI:
                     address = addr_elem.get_text(strip=True)
                     break
             
-            # Extract details (beds, baths, sqft)
+            # Modern details selectors
             details_selectors = [
                 '[data-test="property-card-details"]',
-                '.PropertyCardWrapper__StyledPropertyDetails',
-                '.list-card-details',
+                '.PropertyCardWrapper__StyledPropertyCardDataWrapper ul',
+                '[data-testid="bed-bath-sqft"]',
                 '.property-details'
             ]
             
@@ -390,7 +504,8 @@ class ZillowRealEstateAPI:
                     bedrooms = self._extract_bedrooms(details_text)
                     bathrooms = self._extract_bathrooms(details_text)
                     square_feet = self._extract_square_feet(details_text)
-                    break
+                    if bedrooms > 0 or bathrooms > 0 or square_feet > 0:
+                        break
             
             # Extract URL
             url = "https://www.zillow.com"
@@ -402,7 +517,6 @@ class ZillowRealEstateAPI:
                 elif href.startswith('http'):
                     url = href
             
-            # Only return property if we have valid data
             if price > 0 and address != "Address not available":
                 return Property(
                     address=address,
@@ -417,45 +531,57 @@ class ZillowRealEstateAPI:
             return None
             
         except Exception as e:
-            logger.error(f"Error extracting property from card: {str(e)}")
+            logger.error(f"Error extracting property from modern card: {str(e)}")
             return None
-    
-    def _parse_alternative_format(self, soup: BeautifulSoup, status: str) -> List[Property]:
-        """Alternative parsing method for different page formats"""
-        properties = []
-        
-        # Look for script tags with JSON data
-        script_tags = soup.find_all('script')
-        for script in script_tags:
-            if script.string and ('listResults' in script.string or 'searchResults' in script.string):
-                try:
-                    # Try to extract JSON data
-                    json_match = re.search(r'(\{.*"listResults".*?\})', script.string)
-                    if json_match:
-                        data = json.loads(json_match.group(1))
-                        if 'listResults' in data:
-                            for listing in data['listResults']:
-                                prop = self._create_property_from_json(listing, status)
-                                if prop:
-                                    properties.append(prop)
-                except Exception as e:
-                    continue
-        
-        return properties
     
     def _create_property_from_json(self, listing_data: Dict, status: str) -> Optional[Property]:
         """Create Property object from JSON listing data"""
         try:
-            return Property(
-                address=listing_data.get('address', 'Address not available'),
-                bedrooms=listing_data.get('beds', 0),
-                bathrooms=listing_data.get('baths', 0),
-                square_feet=listing_data.get('area', 0),
-                price=listing_data.get('price', 0) or listing_data.get('unformattedPrice', 0),
-                url=f"https://www.zillow.com{listing_data.get('detailUrl', '')}",
-                status=status,
-                sold_date=listing_data.get('dateSold') if status == 'sold' else None
-            )
+            # Extract address
+            address = "Address not available"
+            if 'address' in listing_data:
+                address = listing_data['address']
+            elif 'addressStreet' in listing_data:
+                address = listing_data['addressStreet']
+            elif 'fullAddress' in listing_data:
+                address = listing_data['fullAddress']
+            
+            # Extract price
+            price = 0
+            price_fields = ['price', 'unformattedPrice', 'listPrice', 'soldPrice']
+            for field in price_fields:
+                if field in listing_data and listing_data[field]:
+                    price = int(listing_data[field])
+                    break
+            
+            # Extract property details
+            bedrooms = listing_data.get('beds', listing_data.get('bedrooms', 0))
+            bathrooms = listing_data.get('baths', listing_data.get('bathrooms', 0))
+            square_feet = listing_data.get('area', listing_data.get('livingArea', listing_data.get('sqft', 0)))
+            
+            # Extract URL
+            url = "https://www.zillow.com"
+            if 'detailUrl' in listing_data:
+                url = f"https://www.zillow.com{listing_data['detailUrl']}"
+            elif 'url' in listing_data:
+                url = listing_data['url']
+            elif 'zpid' in listing_data:
+                url = f"https://www.zillow.com/homedetails/{listing_data['zpid']}_zpid/"
+            
+            if price > 0:
+                return Property(
+                    address=address,
+                    bedrooms=bedrooms if isinstance(bedrooms, int) else 0,
+                    bathrooms=float(bathrooms) if bathrooms else 0,
+                    square_feet=square_feet if isinstance(square_feet, int) else 0,
+                    price=price,
+                    url=url,
+                    status=status,
+                    sold_date=listing_data.get('dateSold') if status == 'sold' else None
+                )
+            
+            return None
+            
         except Exception as e:
             logger.error(f"Error creating property from JSON: {str(e)}")
             return None
@@ -465,13 +591,12 @@ class ZillowRealEstateAPI:
         if not price_text:
             return 0
         
-        # Remove common price prefixes and suffixes
-        price_text = re.sub(r'[^\d,]', '', price_text)
-        price_numbers = re.findall(r'[\d,]+', price_text)
+        # Remove non-numeric characters except commas
+        price_clean = re.sub(r'[^\d,]', '', price_text)
         
-        if price_numbers:
+        if price_clean:
             try:
-                return int(price_numbers[0].replace(',', ''))
+                return int(price_clean.replace(',', ''))
             except ValueError:
                 return 0
         return 0
@@ -541,7 +666,7 @@ class ZillowRealEstateAPI:
         return f"{property_obj.address} - {bed_text}, {bath_text}, {sqft_text} - {price_text} - {property_obj.url}"
 
 # FastAPI Application
-app = FastAPI(title="Improved Zillow Real Estate API", version="2.0.0")
+app = FastAPI(title="Modern Zillow Real Estate API", version="3.0.0")
 
 # CORS middleware
 app.add_middleware(
@@ -574,11 +699,16 @@ class PropertySearchResponse(BaseModel):
     comparables: List[str] = []
     total_comps_found: int = 0
     error: Optional[str] = None
-    location_info: Optional[Dict] = None
+    region_info: Optional[Dict] = None
 
 @app.get("/")
 async def root():
-    return {"message": "Improved Zillow Real Estate API", "version": "2.0.0"}
+    return {"message": "Modern Zillow Real Estate API", "version": "3.0.0"}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/search")
 async def search_properties(
@@ -591,9 +721,7 @@ async def search_properties(
     south: Optional[float] = Query(None, description="Southern latitude boundary"),
     north: Optional[float] = Query(None, description="Northern latitude boundary")
 ):
-    """
-    Search for subject property and comparable properties
-    """
+    """Search for subject property and comparable properties"""
     try:
         # Create map bounds if all coordinates are provided
         map_bounds = None
@@ -608,14 +736,12 @@ async def search_properties(
 
 @app.post("/search")
 async def search_properties_post(request: PropertySearchRequest):
-    """
-    Search for subject property and comparable properties (POST method)
-    """
+    """Search for subject property and comparable properties (POST method)"""
     try:
         # Convert Pydantic model to dataclass if provided
         map_bounds = None
         if request.map_bounds:
-            map_bounds = MapBounds(
+           map_bounds = MapBounds(
                 west=request.map_bounds.west,
                 east=request.map_bounds.east,
                 south=request.map_bounds.south,
@@ -623,58 +749,58 @@ async def search_properties_post(request: PropertySearchRequest):
             )
         
         results = zillow_api.find_subject_property_and_comps(
-            request.city, request.state, request.min_price, request.max_price, map_bounds
+            request.city, 
+            request.state, 
+            request.min_price, 
+            request.max_price, 
+            map_bounds
         )
         return PropertySearchResponse(**results)
     except Exception as e:
         logger.error(f"Search POST endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+@app.get("/cities")
+async def get_supported_cities():
+    """Get list of cities with predefined map bounds"""
+    return {
+        "supported_cities": list(zillow_api.city_bounds.keys()),
+        "note": "These cities have predefined map bounds for better search accuracy"
+    }
 
-@app.get("/debug/{city}/{state}")
-async def debug_location(city: str, state: str):
-    """Debug endpoint to see what's happening with location detection"""
+@app.get("/region-info/{city}/{state}")
+async def get_region_info(city: str, state: str):
+    """Get region information for a specific city and state"""
     try:
-        import time
-        
-        city_formatted = city.lower().replace(' ', '-')
-        state_formatted = state.lower()
-        
-        test_urls = [
-            f"https://www.zillow.com/homes/{city_formatted}-{state_formatted}_rb/",
-            f"https://www.zillow.com/{city_formatted}-{state_formatted}/",
-            f"https://www.zillow.com/homes/{city_formatted}_{state_formatted}_rb/",
-        ]
-        
-        results = []
-        
-        for url in test_urls:
-            try:
-                response = requests.get(url, timeout=10)
-                content_preview = response.text[:500] if response.text else "No content"
-                
-                results.append({
-                    "url": url,
-                    "status_code": response.status_code,
-                    "content_length": len(response.text) if response.text else 0,
-                    "content_preview": content_preview,
-                    "has_zillow_indicators": any(indicator in response.text.lower() for indicator in ['zillow', 'property', 'real estate']) if response.text else False
-                })
-                time.sleep(1)  # Delay between requests
-            except Exception as e:
-                results.append({
-                    "url": url,
-                    "error": str(e)
-                })
-        
-        return {"city": city, "state": state, "test_results": results}
+        region_info = zillow_api._get_region_info(city, state)
+        if region_info:
+            return {"region_info": region_info}
+        else:
+            raise HTTPException(status_code=404, detail=f"Region information not found for {city}, {state}")
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Region info endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Railway deployment
+# Error handler for validation errors
+@app.exception_handler(422)
+async def validation_exception_handler(request, exc):
+    return {"error": "Validation Error", "details": str(exc)}
+
+# Error handler for general exceptions
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {str(exc)}")
+    return {"error": "Internal Server Error", "message": "An unexpected error occurred"}
+
 if __name__ == "__main__":
+    # Get port from environment variable (Railway sets this automatically)
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    
+    # Configure uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        access_log=True
+    )
