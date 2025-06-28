@@ -73,7 +73,8 @@ class ZillowRealEstateAPI:
                 return {
                     "error": f"Could not find location information for {city}, {state}",
                     "subject_property": None,
-                    "comparables": []
+                    "comparables": [],
+                    "total_comps_found": 0
                 }
             
             # Search for active listings (subject property)
@@ -100,7 +101,8 @@ class ZillowRealEstateAPI:
             return {
                 "error": f"API Error: {str(e)}",
                 "subject_property": None,
-                "comparables": []
+                "comparables": [],
+                "total_comps_found": 0
             }
     
     def _get_location_info(self, city: str, state: str) -> Optional[Dict]:
@@ -502,9 +504,9 @@ class PropertySearchRequest(BaseModel):
     map_bounds: Optional[MapBoundsModel] = None
 
 class PropertySearchResponse(BaseModel):
-    subject_property: Optional[str]
-    comparables: List[str]
-    total_comps_found: int
+    subject_property: Optional[str] = None
+    comparables: List[str] = []
+    total_comps_found: int = 0
     error: Optional[str] = None
     location_info: Optional[Dict] = None
 
