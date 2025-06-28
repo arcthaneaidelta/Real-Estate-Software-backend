@@ -28,6 +28,13 @@ class Property:
     sold_date: Optional[str] = None
     property_type: str = "house"
 
+@dataclass
+class MapBounds:
+    west: float
+    east: float
+    south: float
+    north: float
+
 class ZillowRealEstateAPI:
     def __init__(self):
         self.session = requests.Session()
@@ -45,9 +52,9 @@ class ZillowRealEstateAPI:
             'Cache-Control': 'max-age=0'
         })
     
-    def find_subject_property_and_comps(self, city: str, state: str, min_price: int, max_price: int) -> Dict[str, Any]:
+    def find_subject_property_and_comps(self, city: str, state: str, min_price: int, max_price: int, map_bounds: Optional[MapBounds] = None) -> Dict[str, Any]:
         try:
-            subject_property = self.find_subject_property(city, state, min_price, max_price)
+            subject_property = self.find_subject_property(city, state, min_price, max_price, map_bounds)
             
             if not subject_property:
                 return {
@@ -56,7 +63,7 @@ class ZillowRealEstateAPI:
                     "comparables": []
                 }
             
-            comparables = self.find_comparable_properties(city, state, min_price, max_price, 10)
+            comparables = self.find_comparable_properties(city, state, min_price, max_price, 10, map_bounds)
             
             return {
                 "subject_property": self._format_property_output(subject_property),
@@ -71,11 +78,19 @@ class ZillowRealEstateAPI:
                 "comparables": []
             }
     
-    def find_subject_property(self, city: str, state: str, min_price: int, max_price: int) -> Optional[Property]:
+    def find_subject_property(self, city: str, state: str, min_price: int, max_price: int, map_bounds: Optional[MapBounds] = None) -> Optional[Property]:
+        # Use provided map bounds or default to global bounds
+        bounds = {
+            "west": map_bounds.west if map_bounds else -180,
+            "east": map_bounds.east if map_bounds else 180,
+            "south": map_bounds.south if map_bounds else -90,
+            "north": map_bounds.north if map_bounds else 90
+        }
+        
         search_query_state = {
             "pagination": {},
             "isMapVisible": True,
-            "mapBounds": {"west": -180, "east": 180, "south": -90, "north": 90},
+            "mapBounds": bounds,
             "regionSelection": [{"regionId": 0, "regionType": 6}],
             "filterState": {
                 "sort": {"value": "globalrelevanceex"},
@@ -98,11 +113,19 @@ class ZillowRealEstateAPI:
         properties = self._search_zillow(city, state, search_query_state)
         return properties[0] if properties else None
     
-    def find_comparable_properties(self, city: str, state: str, min_price: int, max_price: int, limit: int = 10) -> List[Property]:
+    def find_comparable_properties(self, city: str, state: str, min_price: int, max_price: int, limit: int = 10, map_bounds: Optional[MapBounds] = None) -> List[Property]:
+        # Use provided map bounds or default to global bounds
+        bounds = {
+            "west": map_bounds.west if map_bounds else -180,
+            "east": map_bounds.east if map_bounds else 180,
+            "south": map_bounds.south if map_bounds else -90,
+            "north": map_bounds.north if map_bounds else 90
+        }
+        
         search_query_state = {
             "pagination": {},
             "isMapVisible": True,
-            "mapBounds": {"west": -180, "east": 180, "south": -90, "north": 90},
+            "mapBounds": bounds,
             "regionSelection": [{"regionId": 0, "regionType": 6}],
             "filterState": {
                 "sort": {"value": "globalrelevanceex"},
@@ -329,11 +352,18 @@ app.add_middleware(
 zillow_api = ZillowRealEstateAPI()
 
 # Pydantic models for request/response
+class MapBoundsModel(BaseModel):
+    west: float
+    east: float
+    south: float
+    north: float
+
 class PropertySearchRequest(BaseModel):
     city: str
     state: str
     min_price: int
     max_price: int
+    map_bounds: Optional[MapBoundsModel] = None
 
 class PropertySearchResponse(BaseModel):
     subject_property: Optional[str]
@@ -350,13 +380,22 @@ async def search_properties(
     city: str = Query(..., description="City name"),
     state: str = Query(..., description="State abbreviation (e.g., CA, NY)"),
     min_price: int = Query(..., description="Minimum price in dollars"),
-    max_price: int = Query(..., description="Maximum price in dollars")
+    max_price: int = Query(..., description="Maximum price in dollars"),
+    west: Optional[float] = Query(None, description="Western longitude boundary"),
+    east: Optional[float] = Query(None, description="Eastern longitude boundary"),
+    south: Optional[float] = Query(None, description="Southern latitude boundary"),
+    north: Optional[float] = Query(None, description="Northern latitude boundary")
 ):
     """
     Search for subject property and comparable properties
     """
     try:
-        results = zillow_api.find_subject_property_and_comps(city, state, min_price, max_price)
+        # Create map bounds if all coordinates are provided
+        map_bounds = None
+        if all(coord is not None for coord in [west, east, south, north]):
+            map_bounds = MapBounds(west=west, east=east, south=south, north=north)
+        
+        results = zillow_api.find_subject_property_and_comps(city, state, min_price, max_price, map_bounds)
         return PropertySearchResponse(**results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -367,8 +406,18 @@ async def search_properties_post(request: PropertySearchRequest):
     Search for subject property and comparable properties (POST method)
     """
     try:
+        # Convert Pydantic model to dataclass if provided
+        map_bounds = None
+        if request.map_bounds:
+            map_bounds = MapBounds(
+                west=request.map_bounds.west,
+                east=request.map_bounds.east,
+                south=request.map_bounds.south,
+                north=request.map_bounds.north
+            )
+        
         results = zillow_api.find_subject_property_and_comps(
-            request.city, request.state, request.min_price, request.max_price
+            request.city, request.state, request.min_price, request.max_price, map_bounds
         )
         return PropertySearchResponse(**results)
     except Exception as e:
@@ -382,4 +431,3 @@ async def health_check():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-    
