@@ -108,11 +108,16 @@ class ZillowRealEstateAPI:
     def _get_location_info(self, city: str, state: str) -> Optional[Dict]:
         """Get location information including region ID and proper URL format"""
         try:
-            # Try different URL formats for the city
+            # Try different URL formats for the city based on current Zillow structure
+            city_formatted = city.lower().replace(' ', '-')
+            state_formatted = state.lower()
+            
             possible_urls = [
-                f"https://www.zillow.com/{city.lower().replace(' ', '-')}-{state.lower()}/",
-                f"https://www.zillow.com/{city.lower().replace(' ', '')}-{state.lower()}/",
-                f"https://www.zillow.com/{city.lower()}-{state.lower()}/",
+                f"https://www.zillow.com/homes/{city_formatted}-{state_formatted}_rb/",
+                f"https://www.zillow.com/{city_formatted}-{state_formatted}/",
+                f"https://www.zillow.com/homes/{city_formatted}_{state_formatted}_rb/",
+                f"https://www.zillow.com/{city_formatted}-{state_formatted}-{state_formatted}/",
+                f"https://www.zillow.com/homes/for_sale/{city_formatted}-{state_formatted}/",
             ]
             
             for url in possible_urls:
@@ -121,12 +126,30 @@ class ZillowRealEstateAPI:
                 
                 try:
                     response = self.session.get(url, timeout=15)
+                    logger.info(f"Response status: {response.status_code} for URL: {url}")
+                    
                     if response.status_code == 200:
-                        # Extract region info from the page
-                        region_info = self._extract_region_info(response.text, url)
-                        if region_info:
-                            logger.info(f"Successfully found location info for {city}, {state}")
-                            return region_info
+                        # Check if the page contains property listings or region data
+                        if self._validate_zillow_page(response.text):
+                            region_info = self._extract_region_info(response.text, url)
+                            if region_info:
+                                logger.info(f"Successfully found location info for {city}, {state}")
+                                return region_info
+                            else:
+                                # Even if we can't extract region info, if it's a valid page, use it
+                                logger.info(f"Valid Zillow page found, using basic info for {city}, {state}")
+                                return {
+                                    'region_id': 0,
+                                    'region_type': 6,
+                                    'base_url': url,
+                                    'region_name': f"{city}, {state}",
+                                    'state_abbreviation': state
+                                }
+                    elif response.status_code == 404:
+                        logger.info(f"URL not found: {url}")
+                    else:
+                        logger.warning(f"Unexpected status code {response.status_code} for {url}")
+                        
                 except Exception as e:
                     logger.warning(f"Failed to fetch {url}: {str(e)}")
                     continue
@@ -137,6 +160,31 @@ class ZillowRealEstateAPI:
         except Exception as e:
             logger.error(f"Error getting location info: {str(e)}")
             return None
+    
+    def _validate_zillow_page(self, html_content: str) -> bool:
+        """Check if the page is a valid Zillow property search page"""
+        try:
+            # Check for common Zillow page elements
+            indicators = [
+                'zillow.com',
+                'property',
+                'real estate',
+                'homes for sale',
+                'searchPageState',
+                'listResults',
+                'property-card',
+                'SearchPageState'
+            ]
+            
+            html_lower = html_content.lower()
+            found_indicators = sum(1 for indicator in indicators if indicator in html_lower)
+            
+            # If we find at least 3 indicators, consider it a valid Zillow page
+            is_valid = found_indicators >= 3
+            logger.info(f"Page validation: {found_indicators}/{len(indicators)} indicators found, valid: {is_valid}")
+            
+            return is_valid
+            
     
     def _extract_region_info(self, html_content: str, base_url: str) -> Optional[Dict]:
         """Extract region information from Zillow page"""
@@ -188,17 +236,35 @@ class ZillowRealEstateAPI:
             return None
     
     def _search_properties(self, location_info: Dict, min_price: int, max_price: int, status: str, limit: int = 10) -> List[Property]:
-        """Search for properties using Zillow's search API"""
+        """Search for properties using Zillow's search page"""
         try:
-            # Build search query
-            search_params = self._build_search_params(location_info, min_price, max_price, status)
+            base_url = location_info['base_url']
             
-            # Try the search results page
-            search_url = f"{location_info['base_url']}?{urlencode(search_params)}"
+            # Build search URL with filters
+            if status == "for_sale":
+                # For active listings
+                if base_url.endswith('_rb/'):
+                    search_url = base_url[:-4] + f"/{min_price}-{max_price}_price/_rb/"
+                else:
+                    search_url = base_url.rstrip('/') + f"/{min_price}-{max_price}_price/"
+            else:
+                # For sold properties
+                if base_url.endswith('_rb/'):
+                    search_url = base_url[:-4] + f"/sold/{min_price}-{max_price}_price/_rb/"
+                else:
+                    search_url = base_url.rstrip('/') + f"/sold/{min_price}-{max_price}_price/"
+            
             logger.info(f"Searching: {search_url}")
             
             time.sleep(self.request_delay)
             response = self.session.get(search_url, timeout=15)
+            
+            if response.status_code != 200:
+                # Try alternative URL format
+                alt_url = f"https://www.zillow.com/homes/for_sale/{min_price}-{max_price}_price/?searchQueryState=%7B%22pagination%22%3A%7B%7D%2C%22isMapVisible%22%3Atrue%7D"
+                logger.info(f"Trying alternative URL: {alt_url}")
+                time.sleep(self.request_delay)
+                response = self.session.get(alt_url, timeout=15)
             
             if response.status_code != 200:
                 logger.warning(f"Search request failed with status {response.status_code}")
@@ -568,14 +634,45 @@ async def search_properties_post(request: PropertySearchRequest):
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
-@app.get("/test/{city}/{state}")
-async def test_location(city: str, state: str):
-    """Test endpoint to check if location can be found"""
+@app.get("/debug/{city}/{state}")
+async def debug_location(city: str, state: str):
+    """Debug endpoint to see what's happening with location detection"""
     try:
-        location_info = zillow_api._get_location_info(city, state)
-        return {"location_info": location_info, "found": location_info is not None}
+        import time
+        
+        city_formatted = city.lower().replace(' ', '-')
+        state_formatted = state.lower()
+        
+        test_urls = [
+            f"https://www.zillow.com/homes/{city_formatted}-{state_formatted}_rb/",
+            f"https://www.zillow.com/{city_formatted}-{state_formatted}/",
+            f"https://www.zillow.com/homes/{city_formatted}_{state_formatted}_rb/",
+        ]
+        
+        results = []
+        
+        for url in test_urls:
+            try:
+                response = requests.get(url, timeout=10)
+                content_preview = response.text[:500] if response.text else "No content"
+                
+                results.append({
+                    "url": url,
+                    "status_code": response.status_code,
+                    "content_length": len(response.text) if response.text else 0,
+                    "content_preview": content_preview,
+                    "has_zillow_indicators": any(indicator in response.text.lower() for indicator in ['zillow', 'property', 'real estate']) if response.text else False
+                })
+                time.sleep(1)  # Delay between requests
+            except Exception as e:
+                results.append({
+                    "url": url,
+                    "error": str(e)
+                })
+        
+        return {"city": city, "state": state, "test_results": results}
     except Exception as e:
-        return {"error": str(e), "found": False}
+        return {"error": str(e)}
 
 # Railway deployment
 if __name__ == "__main__":
