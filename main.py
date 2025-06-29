@@ -130,12 +130,14 @@ class ZillowScraper:
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
+            "Referer": "https://www.google.com/",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Cache-Control": "max-age=0"
+            "Sec-Fetch-Site": "cross-site",
+            "Cache-Control": "max-age=0",
+            "Cookie": "zguid=24|%24fef1a295-9778-4650-adc4-24e2f3d36c7a; zjs_user_id=null; zjs_anonymous_id=%22fef1a295-9778-4650-adc4-24e2f3d36c7a%22"
         }
         
         self.min_delay = 1
