@@ -131,6 +131,7 @@ class ZillowScraper:
             "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
             "Referer": "https://www.google.com/",
+            "Origin": "https://www.google.com",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
