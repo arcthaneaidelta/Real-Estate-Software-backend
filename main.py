@@ -468,6 +468,10 @@ async def get_logs(limit: int = Query(100, ge=1, le=1000, description="Number of
         "logs": recent_logs
     }
 
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
 
 # The /docs endpoint is automatically created by FastAPI
 
