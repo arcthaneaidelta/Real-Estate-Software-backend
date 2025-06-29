@@ -369,6 +369,16 @@ async def root():
         }
     }
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for deployment platforms"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "Zillow Property Scraper API"
+    }
+
+
 
 @app.get("/search", response_model=SearchResponse)
 async def search_properties_get(
@@ -468,13 +478,12 @@ async def get_logs(limit: int = Query(100, ge=1, le=1000, description="Number of
         "logs": recent_logs
     }
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
 
 
 # The /docs endpoint is automatically created by FastAPI
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
